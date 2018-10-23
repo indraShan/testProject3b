@@ -6,16 +6,25 @@ defmodule Chord.Node do
   @stabilize_interval 50
   @fix_fingers_interval 100
   @check_predecessor_interval 100
+  @query_interval 1000
 
   # Public methods
-  def start_link(m, id) do
-    start_link(m, id, nil)
+  def start_link(m, id, application) do
+    start_link(m, id, nil, application)
   end
 
-  def start_link(m, id, existing_node) do
+  def simulate_failure(pid) do
+    Process.send_after(pid, {:you_will_die}, 0)
+  end
+
+  def stop_talking(pid) do
+    GenServer.cast(pid, {:stop_talking})
+  end
+
+  def start_link(m, id, existing_node, application) do
     GenServer.start_link(
       __MODULE__,
-      [m: m, id: id, existing_node: existing_node],
+      [m: m, id: id, existing_node: existing_node, application: application],
       []
     )
   end
@@ -46,14 +55,18 @@ defmodule Chord.Node do
 
   # Private methods after this point.
   def init(opts) do
-    max_hash_value = :math.pow(2, opts[:m]) |> round
+    max_hash_value = (:math.pow(2, opts[:m]) |> round) - 1
 
     state = %{
       m: opts[:m],
       predecessor: nil,
       max_hash_value: max_hash_value,
       next: 0,
-      ID: opts[:id]
+      ID: opts[:id],
+      stop_asking_queries: false,
+      application: opts[:application],
+      node_has_asked_enough_queries: false,
+      who_is_predecessor_attemps: 0
     }
 
     if opts[:existing_node] != nil do
@@ -66,7 +79,14 @@ defmodule Chord.Node do
     schedule_fix_fingers_timer()
     # Start fix fingers flow
     schedule_check_predecessor_timer()
+
+    # Start the query timer
+    schedule_query_timer()
     {:ok, state}
+  end
+
+  defp schedule_query_timer() do
+    Process.send_after(self(), {:ask_someone_something}, @query_interval)
   end
 
   defp schedule_check_predecessor_timer() do
@@ -96,14 +116,18 @@ defmodule Chord.Node do
         end
 
       key1 > key2 ->
-        if (id >= 0 and id < key2) or (id > key1 and id < max_hash_value) do
+        if (id >= 0 and id < key2) or (id > key1 and id <= max_hash_value) do
           true
         else
           false
         end
 
       true ->
-        false
+        if id != key2 and id != key1 do
+          true
+        else
+          false
+        end
     end
   end
 
@@ -118,14 +142,18 @@ defmodule Chord.Node do
         end
 
       key1 > key2 ->
-        if (id >= 0 and id <= key2) or (id > key1 and id < max_hash_value) do
+        if (id >= 0 and id <= key2) or (id > key1 and id <= max_hash_value) do
           true
         else
           false
         end
 
       true ->
-        false
+        if id != key1 do
+          true
+        else
+          false
+        end
     end
   end
 
@@ -215,6 +243,31 @@ defmodule Chord.Node do
     end
   end
 
+  defp ask_query(query, state, hops, source_pid) do
+    successor = get_successor(state)
+    successor_id = Enum.at(successor, 0)
+    max_hash_value = state |> Map.get(:max_hash_value)
+    application = state |> Map.get(:application)
+    # Passed-in id falls within this and successor
+    if key_inbetween_inclusive_right(query, get_ID(state), successor_id, max_hash_value) do
+      # successor_pid should have the answer for current query.
+      # Let the app, know the query was answered.
+      GenServer.cast(application, {:query_answered, source_pid, hops + 1})
+    else
+      closest_successor_pid = closest_preceding_node(query, state)
+
+      if closest_successor_pid == self() do
+        GenServer.cast(application, {:query_answered, source_pid, hops})
+      else
+        # Its someone else's headache
+        GenServer.cast(
+          closest_successor_pid,
+          {:find_successor_for_answering, query, hops + 1, source_pid}
+        )
+      end
+    end
+  end
+
   # id: HashId that should be searched for a successor.
   # state: self's current state
   # querySourcePid: the pid of node that is asking for a successor.
@@ -252,7 +305,7 @@ defmodule Chord.Node do
 
   # handle_*
   def handle_cast({:create_ring}, state) do
-    IO.puts("Create ring called. ID = #{get_ID(state)}")
+    # IO.puts("Create ring called. ID = #{get_ID(state)}")
     # Make self the first successor. predecessor stays nil.
     # successor_map is a map of integer => [id, pid]
     # [id, pid] => Hash ID of the othe process, pid is the processId of that
@@ -338,6 +391,8 @@ defmodule Chord.Node do
     #
     # successor.notify(n);
 
+    # reset the attempt counter to 0.
+    state = state |> Map.put(:who_is_predecessor_attemps, 0)
     # Make sure that the responding node is still the successor of this node.
     successor = get_successor(state)
     current_successor_id = Enum.at(successor, 0)
@@ -412,6 +467,66 @@ defmodule Chord.Node do
     {:noreply, state |> Map.put(:predecessor, updated_predecessor)}
   end
 
+  def next_valid_successor(state) do
+    successor = get_successor(state)
+    current_successor_ID = Enum.at(successor, 0)
+
+    successor_map = state |> Map.get(:successor_map)
+    successor_keys = successor_map |> Map.keys()
+    # Ascending sort
+    successor_sorted_keys = Enum.sort(successor_keys)
+
+    matches =
+      Enum.filter(successor_sorted_keys, fn key ->
+        successor_map |> Map.get(key) |> Enum.at(0) != current_successor_ID
+      end)
+
+    if length(matches) != 0 do
+      matches |> Enum.at(0)
+    else
+      -1
+    end
+  end
+
+  def check_predecessor(state) do
+    successor = get_successor(state)
+    attempts = state |> Map.get(:who_is_predecessor_attemps)
+
+    if attempts <= -3 do
+      # Current successor has failed. From the finger table
+      # Get the next valid successor
+      next_successor_key = next_valid_successor(state)
+
+      if next_successor_key != -1 do
+        successor_map = state |> Map.get(:successor_map)
+        valid_successor = successor_map |> Map.get(next_successor_key)
+
+        map =
+          elem(
+            Enum.map_reduce(1..next_successor_key, successor_map, fn x, acc ->
+              {x,
+               acc
+               |> Map.put(x, valid_successor)}
+            end),
+            1
+          )
+
+        successor_map = map
+        state = state |> Map.put(:successor_map, successor_map)
+        state |> Map.put(:who_is_predecessor_attemps, 0)
+      else
+        state
+      end
+    else
+      attempts = attempts - 1
+      successor_pid = Enum.at(successor, 1)
+      # Ask the successor for its predecessor.
+      GenServer.cast(successor_pid, {:who_is_your_predecessor, self()})
+
+      state |> Map.put(:who_is_predecessor_attemps, attempts)
+    end
+  end
+
   def handle_info({:stabilize}, state) do
     # x = successor.predecessor;
     #   if (x ∈ (n, successor))
@@ -422,16 +537,17 @@ defmodule Chord.Node do
     # IO.puts("stabilizing node #{get_ID(state)}")
     # print_state(self())
 
-    if successor != nil do
-      successor_pid = Enum.at(successor, 1)
-      # Ask the successor for its predecessor.
-      GenServer.cast(successor_pid, {:who_is_your_predecessor, self()})
-    end
+    updated_state =
+      if successor != nil do
+        check_predecessor(state)
+      else
+        state
+      end
 
     # Reschedule the timer
     schedule_stabilize_timer()
 
-    {:noreply, state}
+    {:noreply, updated_state}
   end
 
   # Gets called when this node is asked by the caller to join
@@ -483,7 +599,7 @@ defmodule Chord.Node do
         state |> Map.put(:successor_map, successor_map)
       end
 
-    print_state(self())
+    # print_state(self())
     {:noreply, updated_state}
   end
 
@@ -518,7 +634,7 @@ defmodule Chord.Node do
       if current_predecessor != nil do
         # If we have tried enough number of times with no response, assume that the node has failed.
         attempts = Enum.at(current_predecessor, 2)
-
+        # IO.puts("attempts = #{attempts}")
         if attempts <= -3 do
           # Node has failed
           # IO.puts("predecessor failed")
@@ -562,6 +678,23 @@ defmodule Chord.Node do
     {:noreply, state}
   end
 
+  def handle_info({:ask_someone_something}, state) do
+    successor = get_successor(state)
+    node_has_asked_enough_queries = state |> Map.get(:node_has_asked_enough_queries)
+    # We cant ask a query till we have a successor.
+    # If the node has been asked to stop, it should not send a query now.
+    if node_has_asked_enough_queries == false and successor != nil and
+         successor |> Enum.at(1) != self() do
+      # Generate a random number.
+      max_hash_value = state |> Map.get(:max_hash_value)
+      query = Enum.random(0..max_hash_value)
+      ask_query(query, state, 0, self())
+      schedule_query_timer()
+    end
+
+    {:noreply, state}
+  end
+
   def handle_info({:fix_fingers}, state) do
     next = state |> Map.get(:next)
     next = next + 1
@@ -575,11 +708,26 @@ defmodule Chord.Node do
       end
 
     searchID = get_ID(state) + (:math.pow(2, next - 1) |> round)
+    searchID = rem(searchID, Map.get(state, :max_hash_value) + 1) |> round
+
     find_successor(searchID, state, next, self())
 
     # Reschedule the timer
     schedule_fix_fingers_timer()
 
     {:noreply, state |> Map.put(:next, next)}
+  end
+
+  def handle_cast({:find_successor_for_answering, query, hops, querySourcePid}, state) do
+    ask_query(query, state, hops, querySourcePid)
+    {:noreply, state}
+  end
+
+  def handle_cast({:stop_talking}, state) do
+    {:noreply, state |> Map.put(:node_has_asked_enough_queries, true)}
+  end
+
+  def handle_info({:you_will_die}, state) do
+    {:stop, :normal, state}
   end
 end
